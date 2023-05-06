@@ -15,9 +15,6 @@ use tokio::{
     sync::Mutex,
 };
 
-pub mod stream_drop_by_mpsc;
-pub mod buf_with_bytesmut;
-
 const UDP_BUFFER_SIZE: usize = 17480; // 17kb
                                       // const UDP_TIMEOUT: u64 = 10 * 1000; // 10sec
 const CHANNEL_LEN: usize = 100;
@@ -66,57 +63,73 @@ impl UdpListener {
         let handler = tokio::spawn(async move {
             let mut streams: HashMap<
                 SocketAddr,
-                (mpsc::Sender<(Vec<u8>, usize)>, Arc<Mutex<bool>>),
+                mpsc::Sender<(Vec<u8>, usize)>,
+                // (mpsc::Sender<(Vec<u8>, usize)>, Arc<Mutex<bool>>),
             > = HashMap::new();
             let socket = Arc::new(udp_socket);
-            loop {
+            let (drop_tx,mut drop_rx) = mpsc::channel(1);
+
+            loop{
                 let mut buf = vec![0u8; UDP_BUFFER_SIZE];
-                if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
-                    for (k, (_, drop)) in streams.clone().into_iter() {
-                        if let Ok(drop) = drop.try_lock() {
-                            if *drop == true {
-                                streams.remove(&k.clone());
-                                continue;
-                            }
-                        }
+                tokio::select! {
+                    some_drop = drop_rx.recv() => {
+                        let peer_addr = some_drop.unwrap();
+                        streams.remove(&peer_addr);
                     }
-                    match streams.get_mut(&addr) {
-                        Some((child_tx, _)) => {
-                            if let Err(_) = child_tx.send((buf, len)).await {
-                                child_tx.closed().await;
-                                streams.remove(&addr);
-                                continue;
+                    received = socket.recv_from(&mut buf) => {
+
+                        if let Ok((len, addr)) = received{
+                        // if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
+                            // for (k, (_, drop)) in streams.clone().into_iter() {
+                            //     if let Ok(drop) = drop.try_lock() {
+                            //         if *drop == true {
+                            //             streams.remove(&k.clone());
+                            //             continue;
+                            //         }
+                            //     }
+                            // }
+                            match streams.get_mut(&addr) {
+                                Some(child_tx) => {
+                                // Some((child_tx, _)) => {
+                                    if let Err(_) = child_tx.send((buf, len)).await {
+                                        child_tx.closed().await;
+                                        streams.remove(&addr);
+                                        continue;
+                                    }
+                                }
+                                None => {
+                                    let (child_tx, child_rx): (
+                                        mpsc::Sender<(Vec<u8>, usize)>,
+                                        mpsc::Receiver<(Vec<u8>, usize)>,
+                                    ) = mpsc::channel(CHANNEL_LEN);
+                                    // let drop = Arc::new(Mutex::new(false));
+                                    if child_tx.send((buf, len)).await.is_err()
+                                        || tx
+                                            .send((
+                                                UdpStream {
+                                                    local_addr: local_addr,
+                                                    peer_addr: addr,
+                                                    receiver: Arc::new(Mutex::new(child_rx)),
+                                                    socket: socket.clone(),
+                                                    handler: None,
+                                                    drop: Some(drop_tx.clone()),
+                                                    // drop: drop.clone(),
+                                                },
+                                                addr,
+                                            ))
+                                            .await
+                                            .is_err()
+                                    {
+                                        continue;
+                                    };
+                                    streams.insert(addr, child_tx.clone());
+                                    // streams.insert(addr, (child_tx.clone(), drop));
+                                }
                             }
-                        }
-                        None => {
-                            let (child_tx, child_rx): (
-                                mpsc::Sender<(Vec<u8>, usize)>,
-                                mpsc::Receiver<(Vec<u8>, usize)>,
-                            ) = mpsc::channel(CHANNEL_LEN);
-                            let drop = Arc::new(Mutex::new(false));
-                            if child_tx.send((buf, len)).await.is_err()
-                                || tx
-                                    .send((
-                                        UdpStream {
-                                            local_addr: local_addr,
-                                            peer_addr: addr,
-                                            receiver: Arc::new(Mutex::new(child_rx)),
-                                            socket: socket.clone(),
-                                            handler: None,
-                                            drop: drop.clone(),
-                                        },
-                                        addr,
-                                    ))
-                                    .await
-                                    .is_err()
-                            {
-                                continue;
-                            };
-                            streams.insert(addr, (child_tx.clone(), drop));
-                        }
+                        }        
+                        //error?
                     }
                 }
-                //error?
             }
         });
         Ok(Self {
@@ -153,7 +166,8 @@ pub struct UdpStream {
     receiver: Arc<Mutex<mpsc::Receiver<(Vec<u8>, usize)>>>,
     socket: Arc<tokio::net::UdpSocket>,
     handler: Option<tokio::task::JoinHandle<()>>,
-    drop: Arc<Mutex<bool>>,
+    // drop: Arc<Mutex<bool>>,
+    drop: Option<mpsc::Sender<SocketAddr>>,
 }
 
 impl Drop for UdpStream {
@@ -161,9 +175,13 @@ impl Drop for UdpStream {
         if let Some(handler) = &self.handler {
             handler.abort()
         }
-        if let Ok(mut drop) = (&self.drop).try_lock() {
-            *drop = true;
-        }
+
+        if let Some(drop) = &self.drop{
+            let _ = drop.try_send(self.peer_addr.clone());
+        };
+        // if let Ok(mut drop) = (&self.drop).try_lock() {
+        //     *drop = true;
+        // }
     }
 }
 
@@ -207,7 +225,8 @@ impl UdpStream {
             receiver: Arc::new(Mutex::new(child_rx)),
             socket: socket.clone(),
             handler: Some(handler),
-            drop: drop,
+            drop: None,
+            // drop: drop,
         })
     }
     #[allow(unused)]
@@ -220,9 +239,12 @@ impl UdpStream {
     }
     #[allow(unused)]
     pub fn shutdown(&self) {
-        if let Ok(mut drop) = (&self.drop).try_lock() {
-            *drop = true;
-        }
+        if let Some(drop) = &self.drop{
+            let _ = drop.try_send(self.peer_addr.clone());
+        };
+        // if let Ok(mut drop) = (&self.drop).try_lock() {
+        //     *drop = true;
+        // }
     }
 }
 
@@ -260,9 +282,12 @@ impl AsyncWrite for UdpStream {
         match self.socket.poll_send_to(cx, &buf, self.peer_addr) {
             Poll::Ready(Ok(r)) => Poll::Ready(Ok(r)),
             Poll::Ready(Err(e)) => {
-                if let Ok(mut drop) = (&self.drop).try_lock() {
-                    *drop = true;
-                }
+                if let Some(drop) = &self.drop{
+                    let _ = drop.try_send(self.peer_addr.clone());
+                };
+                // if let Ok(mut drop) = (&self.drop).try_lock() {
+                //     *drop = true;
+                // }
                 Poll::Ready(Err(e))
             }
             Poll::Pending => Poll::Pending,
@@ -276,9 +301,8 @@ impl AsyncWrite for UdpStream {
     }
 }
 
-
 #[test]
-fn some_test(){
+fn my_test(){
     use tokio::runtime::Builder;
 
     use std::{net::SocketAddr, str::FromStr, time::Duration};
@@ -291,7 +315,7 @@ fn some_test(){
 
     const MAX_TEST_CONN:usize = 5;
     const SEND_TIMES:usize = 10;
-    const UDP_TIMEOUT: u64 = 1000; // 10sec
+    const UDP_TIMEOUT: u64 = 100; // 10sec
     const UDP_BUFFER_SIZE: usize = 17480; // 17kb
 
     let runtime = Builder::new_current_thread()
@@ -301,7 +325,7 @@ fn some_test(){
 
     let handle1 = runtime.spawn(async {
 
-        let listener = UdpListener::bind(SocketAddr::from_str("127.0.0.1:8080").unwrap()).await.unwrap();
+        let listener = UdpListener::bind(SocketAddr::from_str("127.0.0.1:9080").unwrap()).await.unwrap();
         let mut handles = Vec::with_capacity(MAX_TEST_CONN);
         for _ in 0..MAX_TEST_CONN {
             let (mut stream, _addr) = listener.accept().await.unwrap();
@@ -350,7 +374,7 @@ fn some_test(){
         for _ in 0..MAX_TEST_CONN{
             handles.push(tokio::spawn(async {
                 let socket = UdpSocket::bind(SocketAddr::from_str("127.0.0.1:0").unwrap()).await.unwrap();
-                socket.connect(SocketAddr::from_str("127.0.0.1:8080").unwrap()).await.unwrap();
+                socket.connect(SocketAddr::from_str("127.0.0.1:9080").unwrap()).await.unwrap();
 
                 for i in 0..SEND_TIMES {
                     let mut buffer: Vec<u8> = (0..256).into_iter().map(|_| i as u8).collect();
